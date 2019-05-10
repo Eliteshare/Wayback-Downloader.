@@ -14,19 +14,22 @@ class WaybackMachineDownloader
 
   include ArchiveAPI
 
-  VERSION = "1.1.4"
+  VERSION = "2.2.1"
 
-  attr_accessor :base_url, :directory, :from_timestamp, :to_timestamp, :only_filter, :exclude_filter, :all, :list, :maximum_pages, :threads_count
+  attr_accessor :base_url, :exact_url, :directory, :all_timestamps,
+    :from_timestamp, :to_timestamp, :only_filter, :exclude_filter, 
+    :all, :maximum_pages, :threads_count
 
   def initialize params
     @base_url = params[:base_url]
+    @exact_url = params[:exact_url]
     @directory = params[:directory]
+    @all_timestamps = params[:all_timestamps]
     @from_timestamp = params[:from_timestamp].to_i
     @to_timestamp = params[:to_timestamp].to_i
     @only_filter = params[:only_filter]
     @exclude_filter = params[:exclude_filter]
     @all = params[:all]
-    @list = params[:list]
     @maximum_pages = params[:maximum_pages] ? params[:maximum_pages].to_i : 100
     @threads_count = params[:threads_count].to_i
   end
@@ -78,18 +81,19 @@ class WaybackMachineDownloader
   end
 
   def get_all_snapshots_to_consider
-    # Note: Passing a page index parameter allow us to get more snapshots, but from a less fresh index
+    # Note: Passing a page index parameter allow us to get more snapshots,
+    # but from a less fresh index
     print "Getting snapshot pages"
     snapshot_list_to_consider = ""
     snapshot_list_to_consider += get_raw_list_from_api(@base_url, nil)
     print "."
-    snapshot_list_to_consider += get_raw_list_from_api(@base_url + '/*', nil)
-    print "."
-    @maximum_pages.times do |page_index|
-      snapshot_list = get_raw_list_from_api(@base_url + '/*', page_index)
-      break if snapshot_list.empty?
-      snapshot_list_to_consider += snapshot_list
-      print "."
+    unless @exact_url
+      @maximum_pages.times do |page_index|
+        snapshot_list = get_raw_list_from_api(@base_url + '/*', page_index)
+        break if snapshot_list.empty?
+        snapshot_list_to_consider += snapshot_list
+        print "."
+      end
     end
     puts " found #{snapshot_list_to_consider.lines.count} snaphots to consider."
     puts
@@ -124,18 +128,57 @@ class WaybackMachineDownloader
     file_list_curated
   end
 
+  def get_file_list_all_timestamps
+    file_list_curated = Hash.new
+    get_all_snapshots_to_consider.each_line do |line|
+      next unless line.include?('/')
+      file_timestamp = line[0..13].to_i
+      file_url = line[15..-2]
+      file_id = file_url.split('/')[3..-1].join('/')
+      file_id_and_timestamp = [file_timestamp, file_id].join('/')
+      file_id_and_timestamp = CGI::unescape file_id_and_timestamp 
+      file_id_and_timestamp = file_id_and_timestamp.tidy_bytes unless file_id_and_timestamp == ""
+      if file_id.nil?
+        puts "Malformed file url, ignoring: #{file_url}"
+      else
+        if match_exclude_filter(file_url)
+          puts "File url matches exclude filter, ignoring: #{file_url}"
+        elsif not match_only_filter(file_url)
+          puts "File url doesn't match only filter, ignoring: #{file_url}"
+        elsif file_list_curated[file_id_and_timestamp]
+          puts "Duplicate file and timestamp combo, ignoring: #{file_id}" if @verbose
+        else
+          file_list_curated[file_id_and_timestamp] = {file_url: file_url, timestamp: file_timestamp}
+        end
+      end
+    end
+    puts "file_list_curated: " + file_list_curated.count.to_s
+    file_list_curated
+  end
+
+
   def get_file_list_by_timestamp
-    file_list_curated = get_file_list_curated
-    file_list_curated = file_list_curated.sort_by { |k,v| v[:timestamp] }.reverse
-    file_list_curated.map do |file_remote_info|
-      file_remote_info[1][:file_id] = file_remote_info[0]
-      file_remote_info[1]
+    if @all_timestamps
+      file_list_curated = get_file_list_all_timestamps
+      file_list_curated.map do |file_remote_info|
+        file_remote_info[1][:file_id] = file_remote_info[0]
+        file_remote_info[1]
+      end
+    else
+      file_list_curated = get_file_list_curated
+      file_list_curated = file_list_curated.sort_by { |k,v| v[:timestamp] }.reverse
+      file_list_curated.map do |file_remote_info|
+        file_remote_info[1][:file_id] = file_remote_info[0]
+        file_remote_info[1]
+      end
     end
   end
 
   def list_files
+    # retrieval produces its own output
+    files = get_file_list_by_timestamp
     puts "["
-    get_file_list_by_timestamp.each do |file|
+    files.each do |file|
       puts file.to_json + ","
     end
     puts "]"
@@ -179,7 +222,7 @@ class WaybackMachineDownloader
 
   def structure_dir_path dir_path
     begin
-      FileUtils::mkdir_p dir_path unless File.exists? dir_path
+      FileUtils::mkdir_p dir_path unless File.exist? dir_path
     rescue Errno::EEXIST => e
       error_to_string = e.to_s
       puts "# #{error_to_string}"
@@ -201,7 +244,8 @@ class WaybackMachineDownloader
   end
 
   def download_file file_remote_info
-    file_url = file_remote_info[:file_url]
+    current_encoding = "".encoding
+    file_url = file_remote_info[:file_url].encode(current_encoding)
     file_id = file_remote_info[:file_id]
     file_timestamp = file_remote_info[:timestamp]
     file_path_elements = file_id.split('/')
@@ -216,9 +260,10 @@ class WaybackMachineDownloader
       file_path = backup_path + file_path_elements[0..-1].join('/')
     end
     if Gem.win_platform?
+      dir_path = dir_path.gsub(/[:*?&=<>\\|]/) {|s| '%' + s.ord.to_s(16) }
       file_path = file_path.gsub(/[:*?&=<>\\|]/) {|s| '%' + s.ord.to_s(16) }
     end
-    unless File.exists? file_path
+    unless File.exist? file_path
       begin
         structure_dir_path dir_path
         open(file_path, "wb") do |file|
@@ -239,7 +284,7 @@ class WaybackMachineDownloader
       rescue StandardError => e
         puts "#{file_url} # #{e}"
       ensure
-        if not @all and File.exists?(file_path) and File.size(file_path) == 0
+        if not @all and File.exist?(file_path) and File.size(file_path) == 0
           File.delete(file_path)
           puts "#{file_path} was empty and was removed."
         end
