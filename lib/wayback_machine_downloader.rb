@@ -1,30 +1,54 @@
 # encoding: UTF-8
 
+require 'thread'
+require 'net/http'
 require 'open-uri'
 require 'fileutils'
 require 'cgi'
+require 'json'
 require_relative 'wayback_machine_downloader/tidy_bytes'
 require_relative 'wayback_machine_downloader/to_regex'
+require_relative 'wayback_machine_downloader/archive_api'
 
 class WaybackMachineDownloader
 
-  VERSION = "0.3.0"
+  include ArchiveAPI
 
-  attr_accessor :base_url, :timestamp, :only_filter, :exclude_filter
+  VERSION = "1.1.4"
+
+  attr_accessor :base_url, :directory, :from_timestamp, :to_timestamp, :only_filter, :exclude_filter, :all, :list, :maximum_pages, :threads_count
 
   def initialize params
     @base_url = params[:base_url]
-    @timestamp = params[:timestamp].to_i
+    @directory = params[:directory]
+    @from_timestamp = params[:from_timestamp].to_i
+    @to_timestamp = params[:to_timestamp].to_i
     @only_filter = params[:only_filter]
     @exclude_filter = params[:exclude_filter]
+    @all = params[:all]
+    @list = params[:list]
+    @maximum_pages = params[:maximum_pages] ? params[:maximum_pages].to_i : 100
+    @threads_count = params[:threads_count].to_i
   end
 
   def backup_name
-    @base_url.split('/')[2]
+    if @base_url.include? '//'
+      @base_url.split('/')[2]
+    else
+      @base_url
+    end
   end
 
   def backup_path
-    'websites/' + backup_name + '/'
+    if @directory
+      if @directory[-1] == '/'
+        @directory
+      else
+        @directory + '/'
+      end
+    else
+      'websites/' + backup_name + '/'
+    end
   end
 
   def match_only_filter file_url
@@ -53,32 +77,47 @@ class WaybackMachineDownloader
     end
   end
 
+  def get_all_snapshots_to_consider
+    # Note: Passing a page index parameter allow us to get more snapshots, but from a less fresh index
+    print "Getting snapshot pages"
+    snapshot_list_to_consider = ""
+    snapshot_list_to_consider += get_raw_list_from_api(@base_url, nil)
+    print "."
+    snapshot_list_to_consider += get_raw_list_from_api(@base_url + '/*', nil)
+    print "."
+    @maximum_pages.times do |page_index|
+      snapshot_list = get_raw_list_from_api(@base_url + '/*', page_index)
+      break if snapshot_list.empty?
+      snapshot_list_to_consider += snapshot_list
+      print "."
+    end
+    puts " found #{snapshot_list_to_consider.lines.count} snaphots to consider."
+    puts
+    snapshot_list_to_consider
+  end
+
   def get_file_list_curated
-    index_file_list_raw = open "http://web.archive.org/cdx/search/xd?url=#{@base_url}"
-    all_file_list_raw = open "http://web.archive.org/cdx/search/xd?url=#{@base_url}/*"
     file_list_curated = Hash.new
-    [index_file_list_raw, all_file_list_raw].each do |file|
-      file.each_line do |line|
-        line = line.split(' ')
-        file_timestamp = line[1].to_i
-        file_url = line[2]
-        file_id = file_url.split('/')[3..-1].join('/')
-        file_id = CGI::unescape file_id
-        file_id = file_id.tidy_bytes unless file_id == ""
-        if file_id.nil?
-          puts "Malformed file url, ignoring: #{file_url}"
-        elsif @timestamp == 0 or file_timestamp <= @timestamp
-          if match_exclude_filter(file_url)
-            puts "File url matches exclude filter, ignoring: #{file_url}"
-          elsif not match_only_filter(file_url)
-            puts "File url doesn't match only filter, ignoring: #{file_url}"
-          elsif file_list_curated[file_id]
-            unless file_list_curated[file_id][:timestamp] > file_timestamp
-              file_list_curated[file_id] = {file_url: file_url, timestamp: file_timestamp}
-            end
-          else
+    get_all_snapshots_to_consider.each_line do |line|
+      next unless line.include?('/')
+      file_timestamp = line[0..13].to_i
+      file_url = line[15..-2]
+      file_id = file_url.split('/')[3..-1].join('/')
+      file_id = CGI::unescape file_id 
+      file_id = file_id.tidy_bytes unless file_id == ""
+      if file_id.nil?
+        puts "Malformed file url, ignoring: #{file_url}"
+      else
+        if match_exclude_filter(file_url)
+          puts "File url matches exclude filter, ignoring: #{file_url}"
+        elsif not match_only_filter(file_url)
+          puts "File url doesn't match only filter, ignoring: #{file_url}"
+        elsif file_list_curated[file_id]
+          unless file_list_curated[file_id][:timestamp] > file_timestamp
             file_list_curated[file_id] = {file_url: file_url, timestamp: file_timestamp}
           end
+        else
+          file_list_curated[file_id] = {file_url: file_url, timestamp: file_timestamp}
         end
       end
     end
@@ -94,63 +133,48 @@ class WaybackMachineDownloader
     end
   end
 
+  def list_files
+    puts "["
+    get_file_list_by_timestamp.each do |file|
+      puts file.to_json + ","
+    end
+    puts "]"
+  end
+
   def download_files
-    puts "Downloading #{@base_url} to #{backup_path} from Wayback Machine..."
+    start_time = Time.now
+    puts "Downloading #{@base_url} to #{backup_path} from Wayback Machine archives."
     puts
-    file_list_by_timestamp = get_file_list_by_timestamp
+
     if file_list_by_timestamp.count == 0
       puts "No files to download."
-      puts "Possible reaosons:"
+      puts "Possible reasons:"
       puts "\t* Site is not in Wayback Machine Archive."
+      puts "\t* From timestamp too much in the future." if @from_timestamp and @from_timestamp != 0
+      puts "\t* To timestamp too much in the past." if @to_timestamp and @to_timestamp != 0
       puts "\t* Only filter too restrictive (#{only_filter.to_s})" if @only_filter
       puts "\t* Exclude filter too wide (#{exclude_filter.to_s})" if @exclude_filter
       return
     end
-    count = 0
-    file_list_by_timestamp.each do |file_remote_info|
-      count += 1
-      file_url = file_remote_info[:file_url]
-      file_id = file_remote_info[:file_id]
-      file_timestamp = file_remote_info[:timestamp]
-      file_path_elements = file_id.split('/')
-      if file_id == ""
-        dir_path = backup_path
-        file_path = backup_path + 'index.html'
-      elsif file_url[-1] == '/' or not file_path_elements[-1].include? '.'
-        dir_path = backup_path + file_path_elements[0..-1].join('/')
-        file_path = backup_path + file_path_elements[0..-1].join('/') + '/index.html'
-      else
-        dir_path = backup_path + file_path_elements[0..-2].join('/')
-        file_path = backup_path + file_path_elements[0..-1].join('/')
-      end
-      if Gem.win_platform?
-        file_path = file_path.gsub(/[:*?<>\\|]/) {|s| '%' + s.ord.to_s(16) }
-      end
-      unless File.exists? file_path
-        begin
-          structure_dir_path dir_path
-          open(file_path, "wb") do |file|
-            begin
-              open("http://web.archive.org/web/#{file_timestamp}id_/#{file_url}", "Accept-Encoding" => "plain") do |uri|
-                file.write(uri.read)
-              end
-            rescue OpenURI::HTTPError => e
-              puts "#{file_url} # #{e}"
-              file.write(e.io.read)
-            rescue StandardError => e
-              puts "#{file_url} # #{e}"
-            end
-          end
-        rescue StandardError => e
-          puts "#{file_url} # #{e}"
+ 
+    puts "#{file_list_by_timestamp.count} files to download:"
+
+    threads = []
+    @processed_file_count = 0
+    @threads_count = 1 unless @threads_count != 0
+    @threads_count.times do
+      threads << Thread.new do
+        until file_queue.empty?
+          file_remote_info = file_queue.pop(true) rescue nil
+          download_file(file_remote_info) if file_remote_info
         end
-        puts "#{file_url} -> #{file_path} (#{count}/#{file_list_by_timestamp.size})"
-      else
-        puts "#{file_url} # #{file_path} already exists. (#{count}/#{file_list_by_timestamp.size})"
       end
     end
+
+    threads.each(&:join)
+    end_time = Time.now
     puts
-    puts "Download complete, saved in #{backup_path} (#{file_list_by_timestamp.size} files)"
+    puts "Download completed in #{(end_time - start_time).round(2)}s, saved in #{backup_path} (#{file_list_by_timestamp.size} files)"
   end
 
   def structure_dir_path dir_path
@@ -176,4 +200,71 @@ class WaybackMachineDownloader
     end
   end
 
+  def download_file file_remote_info
+    file_url = file_remote_info[:file_url]
+    file_id = file_remote_info[:file_id]
+    file_timestamp = file_remote_info[:timestamp]
+    file_path_elements = file_id.split('/')
+    if file_id == ""
+      dir_path = backup_path
+      file_path = backup_path + 'index.html'
+    elsif file_url[-1] == '/' or not file_path_elements[-1].include? '.'
+      dir_path = backup_path + file_path_elements[0..-1].join('/')
+      file_path = backup_path + file_path_elements[0..-1].join('/') + '/index.html'
+    else
+      dir_path = backup_path + file_path_elements[0..-2].join('/')
+      file_path = backup_path + file_path_elements[0..-1].join('/')
+    end
+    if Gem.win_platform?
+      file_path = file_path.gsub(/[:*?&=<>\\|]/) {|s| '%' + s.ord.to_s(16) }
+    end
+    unless File.exists? file_path
+      begin
+        structure_dir_path dir_path
+        open(file_path, "wb") do |file|
+          begin
+            open("http://web.archive.org/web/#{file_timestamp}id_/#{file_url}", "Accept-Encoding" => "plain") do |uri|
+              file.write(uri.read)
+            end
+          rescue OpenURI::HTTPError => e
+            puts "#{file_url} # #{e}"
+            if @all
+              file.write(e.io.read)
+              puts "#{file_path} saved anyway."
+            end
+          rescue StandardError => e
+            puts "#{file_url} # #{e}"
+          end
+        end
+      rescue StandardError => e
+        puts "#{file_url} # #{e}"
+      ensure
+        if not @all and File.exists?(file_path) and File.size(file_path) == 0
+          File.delete(file_path)
+          puts "#{file_path} was empty and was removed."
+        end
+      end
+      semaphore.synchronize do
+        @processed_file_count += 1
+        puts "#{file_url} -> #{file_path} (#{@processed_file_count}/#{file_list_by_timestamp.size})"
+      end
+    else
+      semaphore.synchronize do
+        @processed_file_count += 1
+        puts "#{file_url} # #{file_path} already exists. (#{@processed_file_count}/#{file_list_by_timestamp.size})"
+      end
+    end
+  end
+
+  def file_queue
+    @file_queue ||= file_list_by_timestamp.each_with_object(Queue.new) { |file_info, q| q << file_info }
+  end
+
+  def file_list_by_timestamp
+    @file_list_by_timestamp ||= get_file_list_by_timestamp
+  end
+
+  def semaphore
+    @semaphore ||= Mutex.new
+  end
 end
