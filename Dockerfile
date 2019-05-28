@@ -1,4 +1,4 @@
-FROM ruby:2.3
+FROM ruby:2.6
 COPY . /build
 RUN cd build && \
     bundle install
